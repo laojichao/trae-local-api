@@ -1,0 +1,15 @@
+{
+  "name": "trae-local-api",
+  "version": "1.0.0",
+  "description": "Convert Trae CN IDE to local OpenAI/Anthropic compatible API service",
+  "main": "src/server.js",
+  "scripts": {
+    "setup": "node setup.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "dotenv": "^16.4.0",
+    "uuid": "^10.0.0"
+  }
+}
