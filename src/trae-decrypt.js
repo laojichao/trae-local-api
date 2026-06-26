@@ -11,6 +11,7 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 // 4 hardcoded salt arrays from Trae CN's frontend JS (64 bytes each)
@@ -169,19 +170,32 @@ function decryptAuthData(dataDir) {
 }
 
 /**
+ * Get OS-specific app data directory.
+ */
+function getAppDataDir() {
+  if (process.platform === 'win32') {
+    return process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  }
+
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support');
+  }
+
+  return process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+}
+
+/**
  * Get Trae CN data directory path
  */
 function getTraeCNDataDir() {
-  const appData = process.env.APPDATA || path.join(process.env.HOME, 'AppData', 'Roaming');
-  return path.join(appData, 'Trae CN', 'User');
+  return path.join(getAppDataDir(), 'Trae CN', 'User');
 }
 
 /**
  * Get Trae SG data directory path
  */
 function getTraeSGDataDir() {
-  const appData = process.env.APPDATA || path.join(process.env.HOME, 'AppData', 'Roaming');
-  return path.join(appData, 'Trae', 'User');
+  return path.join(getAppDataDir(), 'Trae', 'User');
 }
 
 module.exports = {

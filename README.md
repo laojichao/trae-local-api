@@ -29,7 +29,10 @@ start.bat
 npm start
 ```
 
-首次运行会自动从 `%APPDATA%\Trae CN\User\globalStorage\storage.json` 解密认证数据并保存到 `.env`，之后直接读取 `.env` 启动。
+首次运行会自动从本机 Trae 配置中解密认证数据并保存到 `.env`，之后直接读取 `.env` 启动。
+
+- Windows: `%APPDATA%\Trae CN\User\globalStorage\storage.json`
+- macOS: `~/Library/Application Support/Trae CN/User/globalStorage/storage.json`
 
 ### 3. 连接 Claude Code
 

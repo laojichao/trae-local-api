@@ -137,6 +137,8 @@ function toolsToSystemPrompt(tools) {
   if (!tools || !Array.isArray(tools) || tools.length === 0) return '';
   const lines = ['You have access to the following tools. To use a tool, output EXACTLY this format:', '',
     '<tool_call>', '{"name": "tool_name", "arguments": {"param": "value"}}', '</tool_call>', '',
+    'Do not wrap tool calls in Markdown fences. Do not include any other text inside <tool_call>.',
+    '',
     'Available tools:'];
 
   for (const tool of tools) {
@@ -209,7 +211,7 @@ function convertAnthropicMessages(messages, systemPrompt, tools) {
 
     // Assistant message
     if (m.role === 'assistant') {
-      const textPart = extractTextFromBlocks(m.content);
+      const textPart = cleanContent(extractTextFromBlocks(m.content));
       const toolUses = m.content.filter(b => b.type === 'tool_use');
 
       // No tool calls — plain text
@@ -218,62 +220,37 @@ function convertAnthropicMessages(messages, systemPrompt, tools) {
         i++; continue;
       }
 
-      // Has tool calls — merge with next user's tool_result
-      let combinedText = textPart || '';
-
-      if (i + 1 < messages.length && messages[i + 1].role === 'user') {
-        const nextBlocks = Array.isArray(messages[i + 1].content) ? messages[i + 1].content : [];
-        const toolResults = nextBlocks.filter(b => b.type === 'tool_result');
-        const nextText = extractTextFromBlocks(nextBlocks);
-
-        if (toolResults.length > 0) {
-          const toolLines = toolUses.map(tu => {
-            const inputStr = typeof tu.input === 'object' ? JSON.stringify(tu.input, null, 2) : String(tu.input);
-            return `[Called tool: ${tu.name}]\n${inputStr}`;
-          });
-          const resultLines = toolResults.map(tr => {
-            const prefix = tr.is_error ? '[Tool Error]' : '[Tool Result]';
-            return `${prefix}\n${extractToolResultText(tr)}`;
-          });
-
-          const parts = [];
-          if (combinedText.trim()) parts.push(combinedText);
-          parts.push(toolLines.join('\n\n'));
-          parts.push(resultLines.join('\n\n'));
-          result.push({ role: 'assistant', content: parts.join('\n\n') });
-
-          // Keep any non-tool text from the user message
-          const cleanedNext = cleanContent(nextText);
-          if (cleanedNext) result.push({ role: 'user', content: cleanedNext });
-
-          i += 2; continue;
-        }
-      }
-
-      // No matching tool_result — just describe the calls
       const toolLines = toolUses.map(tu => {
         const inputStr = typeof tu.input === 'object' ? JSON.stringify(tu.input, null, 2) : String(tu.input);
-        return `[Called tool: ${tu.name}]\n${inputStr}`;
+        return `[Tool call: ${tu.name}]\n${inputStr}`;
       });
-      if (combinedText.trim()) combinedText += '\n\n';
-      combinedText += toolLines.join('\n\n');
-      if (combinedText.trim()) result.push({ role: 'assistant', content: combinedText });
+
+      const parts = [];
+      if (textPart.trim()) parts.push(textPart);
+      parts.push(toolLines.join('\n\n'));
+      result.push({ role: 'assistant', content: parts.join('\n\n') });
       i++;
 
     } else if (m.role === 'user') {
       const textPart = extractTextFromBlocks(m.content);
       const toolResults = m.content.filter(b => b.type === 'tool_result');
       const cleanedText = cleanContent(textPart);
+      const parts = [];
 
       if (cleanedText) {
-        result.push({ role: 'user', content: cleanedText });
-      } else if (toolResults.length > 0) {
-        // Orphaned tool results
-        const resultText = toolResults.map(tr => {
-          const prefix = tr.is_error ? '[Tool Error]' : '[Tool Result]';
-          return `${prefix}\n${extractToolResultText(tr)}`;
-        }).join('\n\n');
-        result.push({ role: 'user', content: resultText });
+        parts.push(cleanedText);
+      }
+
+      if (toolResults.length > 0) {
+        parts.push(toolResults.map(tr => {
+          const label = tr.is_error ? 'Tool error' : 'Tool result';
+          const suffix = tr.tool_use_id ? ` for ${tr.tool_use_id}` : '';
+          return `[${label}${suffix}]\n${extractToolResultText(tr)}`;
+        }).join('\n\n'));
+      }
+
+      if (parts.length > 0) {
+        result.push({ role: 'user', content: parts.join('\n\n') });
       }
       i++;
     } else {

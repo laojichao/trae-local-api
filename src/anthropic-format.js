@@ -11,44 +11,154 @@ async function handleAnthropicResponse(fetchResponse, model, stream) {
   return streamGenerator(fetchResponse, model);
 }
 
-async function collectNonStreaming(fetchResponse, model) {
+function makeMessageId() {
+  return `msg_${uuidv4().replace(/-/g, '')}`;
+}
+
+function makeToolUseId() {
+  return `toolu_${uuidv4().replace(/-/g, '')}`;
+}
+
+function normalizeStopReason(reason, hasToolUse) {
+  if (hasToolUse) return 'tool_use';
+  if (!reason || reason === 'stop') return 'end_turn';
+  return reason;
+}
+
+function stripJsonFence(text) {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return match ? match[1].trim() : trimmed;
+}
+
+function normalizeToolInput(value) {
+  if (value === undefined || value === null) return {};
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return {};
+    try {
+      const parsed = JSON.parse(trimmed);
+      return normalizeToolInput(parsed);
+    } catch {
+      return { value };
+    }
+  }
+  if (typeof value === 'object' && !Array.isArray(value)) return value;
+  return { value };
+}
+
+function parseToolCallPayload(payload) {
+  let parsed;
+  try {
+    parsed = JSON.parse(stripJsonFence(payload));
+  } catch {
+    return null;
+  }
+
+  const name = parsed.name || parsed.tool_name || parsed.function?.name;
+  if (!name || typeof name !== 'string') return null;
+
+  return {
+    type: 'tool_use',
+    id: parsed.id || makeToolUseId(),
+    name,
+    input: normalizeToolInput(
+      parsed.input ?? parsed.arguments ?? parsed.parameters ?? parsed.function?.arguments
+    ),
+  };
+}
+
+function textBlock(text) {
+  const value = text.trim();
+  return value ? { type: 'text', text: value } : null;
+}
+
+function parseAssistantContent(text) {
+  if (!text) return [{ type: 'text', text: '' }];
+
+  if (!/<tool_call>/i.test(text)) {
+    const toolUse = parseToolCallPayload(text);
+    if (toolUse) return [toolUse];
+    return [{ type: 'text', text: text.trim() }];
+  }
+
+  const blocks = [];
+  const pattern = /<tool_call>\s*([\s\S]*?)(?:\s*<\/tool_call>|$)/gi;
+  let cursor = 0;
+  let match;
+
+  while ((match = pattern.exec(text)) !== null) {
+    const before = textBlock(text.slice(cursor, match.index));
+    if (before) blocks.push(before);
+
+    const toolUse = parseToolCallPayload(match[1]);
+    if (toolUse) {
+      blocks.push(toolUse);
+    } else {
+      const raw = textBlock(match[0]);
+      if (raw) blocks.push(raw);
+    }
+
+    cursor = pattern.lastIndex;
+  }
+
+  const after = textBlock(text.slice(cursor));
+  if (after) blocks.push(after);
+
+  return blocks.length > 0 ? blocks : [{ type: 'text', text: text.trim() }];
+}
+
+function hasToolUse(blocks) {
+  return blocks.some(block => block.type === 'tool_use');
+}
+
+async function collectTraeText(fetchResponse) {
   const text = await fetchResponse.text();
   const lines = text.split('\n');
   let fullContent = '';
-  let finishReason = 'end_turn';
+  let finishReason = null;
+  let currentEvent = null;
 
   for (const line of lines) {
     const trimmed = line.trim();
-    if (trimmed.startsWith('event:output')) {
-      // next line should be data:
-      continue;
-    }
-    if (trimmed.startsWith('data:')) {
+    if (trimmed.startsWith('event:')) {
+      currentEvent = trimmed.substring(6).trim();
+    } else if (trimmed.startsWith('data:')) {
       const data = trimmed.substring(5).trim();
       try {
         const parsed = JSON.parse(data);
-        if (parsed.response) fullContent += parsed.response;
-        if (parsed.finish_reason) finishReason = parsed.finish_reason === 'stop' ? 'end_turn' : parsed.finish_reason;
+        if (!currentEvent || currentEvent === 'output') {
+          if (parsed.response) fullContent += parsed.response;
+        }
+        if (parsed.finish_reason) finishReason = parsed.finish_reason;
       } catch {}
     }
   }
 
+  return { fullContent, finishReason };
+}
+
+async function collectNonStreaming(fetchResponse, model) {
+  const { fullContent, finishReason } = await collectTraeText(fetchResponse);
+  const content = parseAssistantContent(fullContent);
+  const includesToolUse = hasToolUse(content);
+
   return {
-    id: `msg_${uuidv4().replace(/-/g, '')}`,
+    id: makeMessageId(),
     type: 'message',
     role: 'assistant',
-    content: [{ type: 'text', text: fullContent }],
+    content,
     model,
-    stop_reason: finishReason,
+    stop_reason: normalizeStopReason(finishReason, includesToolUse),
     usage: { input_tokens: 0, output_tokens: 0 },
   };
 }
 
 async function* streamGenerator(fetchResponse, model) {
-  const reader = fetchResponse.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const msgId = `msg_${uuidv4().replace(/-/g, '')}`;
+  const { fullContent, finishReason } = await collectTraeText(fetchResponse);
+  const content = parseAssistantContent(fullContent);
+  const includesToolUse = hasToolUse(content);
+  const msgId = makeMessageId();
 
   // message_start
   yield `event: message_start\ndata: ${JSON.stringify({
@@ -64,69 +174,59 @@ async function* streamGenerator(fetchResponse, model) {
     },
   })}\n\n`;
 
-  // content_block_start
-  yield `event: content_block_start\ndata: ${JSON.stringify({
-    type: 'content_block_start',
-    index: 0,
-    content_block: { type: 'text', text: '' },
-  })}\n\n`;
+  for (let index = 0; index < content.length; index++) {
+    const block = content[index];
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+    if (block.type === 'text') {
+      yield `event: content_block_start\ndata: ${JSON.stringify({
+        type: 'content_block_start',
+        index,
+        content_block: { type: 'text', text: '' },
+      })}\n\n`;
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-
-    let currentEvent = null;
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('event:')) {
-        currentEvent = trimmed.substring(6).trim();
-      } else if (trimmed.startsWith('data:') && currentEvent) {
-        const data = trimmed.substring(5).trim();
-
-        if (currentEvent === 'output') {
-          try {
-            const parsed = JSON.parse(data);
-            const text = parsed.response || '';
-            if (text) {
-              yield `event: content_block_delta\ndata: ${JSON.stringify({
-                type: 'content_block_delta',
-                index: 0,
-                delta: { type: 'text_delta', text },
-              })}\n\n`;
-            }
-          } catch {}
-        } else if (currentEvent === 'done') {
-          // content_block_stop
-          yield `event: content_block_stop\ndata: ${JSON.stringify({
-            type: 'content_block_stop',
-            index: 0,
-          })}\n\n`;
-
-          // message_delta
-          yield `event: message_delta\ndata: ${JSON.stringify({
-            type: 'message_delta',
-            delta: { stop_reason: 'end_turn', stop_sequence: null },
-            usage: { output_tokens: 0 },
-          })}\n\n`;
-
-          // message_stop
-          yield `event: message_stop\ndata: ${JSON.stringify({
-            type: 'message_stop',
-          })}\n\n`;
-          return;
-        }
-
-        currentEvent = null;
+      if (block.text) {
+        yield `event: content_block_delta\ndata: ${JSON.stringify({
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'text_delta', text: block.text },
+        })}\n\n`;
       }
+    } else if (block.type === 'tool_use') {
+      yield `event: content_block_start\ndata: ${JSON.stringify({
+        type: 'content_block_start',
+        index,
+        content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} },
+      })}\n\n`;
+
+      const partialJson = JSON.stringify(block.input || {});
+      yield `event: content_block_delta\ndata: ${JSON.stringify({
+        type: 'content_block_delta',
+        index,
+        delta: { type: 'input_json_delta', partial_json: partialJson },
+      })}\n\n`;
     }
+
+    yield `event: content_block_stop\ndata: ${JSON.stringify({
+      type: 'content_block_stop',
+      index,
+    })}\n\n`;
   }
 
-  yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
+  yield `event: message_delta\ndata: ${JSON.stringify({
+    type: 'message_delta',
+    delta: {
+      stop_reason: normalizeStopReason(finishReason, includesToolUse),
+      stop_sequence: null,
+    },
+    usage: { output_tokens: 0 },
+  })}\n\n`;
+
+  yield `event: message_stop\ndata: ${JSON.stringify({
+    type: 'message_stop',
+  })}\n\n`;
 }
 
-module.exports = { handleAnthropicResponse };
+module.exports = {
+  handleAnthropicResponse,
+  parseAssistantContent,
+};
