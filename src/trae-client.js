@@ -181,15 +181,19 @@ function truncateMessages(messages, maxTokens) {
 /**
  * Build Trae chat request body
  * Each request gets a unique session_id to isolate conversations
+ * @param {Array} messages - 消息列表
+ * @param {string} model - 模型名
+ * @param {boolean} stream - 是否流式
+ * @param {object} options - 额外选项 { maxTokens }
  */
-function buildChatBody(messages, model, stream) {
+function buildChatBody(messages, model, stream, options) {
   // Truncate context to avoid hitting API limits
   const truncated = truncateMessages(messages);
 
   // Generate unique session/request ID to prevent cross-session contamination
   const sessionId = crypto.randomUUID();
 
-  return {
+  const body = {
     messages: truncated.map(m => ({
       role: m.role,
       content: typeof m.content === 'string'
@@ -202,18 +206,33 @@ function buildChatBody(messages, model, stream) {
     request_id: sessionId,
     session_id: sessionId,
   };
+
+  // 透传 max_tokens(若上游支持)
+  const maxTokens = options && options.maxTokens;
+  if (maxTokens && typeof maxTokens === 'number' && maxTokens > 0) {
+    body.max_tokens = maxTokens;
+  }
+
+  return body;
 }
 
 /**
  * Send chat request with 3-level endpoint fallback
  * Returns a readable stream of SSE events
+ * @param {Array} messages - 消息列表
+ * @param {string} model - 模型名
+ * @param {boolean} stream - 是否流式
+ * @param {string} baseUrl - 上游 base URL
+ * @param {object} options - 额外选项 { maxTokens }
  */
-async function sendChatRequest(messages, model, stream, baseUrl) {
+async function sendChatRequest(messages, model, stream, baseUrl, options) {
   const token = auth.getToken();
   const userId = auth.getUserId();
 
   if (!token) {
-    throw new Error('No auth token available');
+    const err = new Error('No auth token available');
+    err.status = 401;
+    throw err;
   }
 
   // Check if token needs refresh
@@ -222,7 +241,7 @@ async function sendChatRequest(messages, model, stream, baseUrl) {
   }
 
   const traeModel = mapModel(model);
-  const body = buildChatBody(messages, traeModel, stream);
+  const body = buildChatBody(messages, traeModel, stream, options);
   const headers = buildHeaders(auth.getToken(), userId);
 
   // 3-level endpoint fallback
@@ -233,6 +252,7 @@ async function sendChatRequest(messages, model, stream, baseUrl) {
   ];
 
   let lastError = null;
+  let lastStatus = 502;
 
   for (const endpoint of endpoints) {
     const url = `${baseUrl}${endpoint}`;
@@ -253,14 +273,25 @@ async function sendChatRequest(messages, model, stream, baseUrl) {
       const text = await resp.text();
       console.warn(`[trae-client] Endpoint ${endpoint} returned ${resp.status}: ${text.substring(0, 500)}`);
       console.warn(`[trae-client] Request body was: ${JSON.stringify(body).substring(0, 500)}`);
-      lastError = new Error(`${endpoint}: ${resp.status} ${text.substring(0, 500)}`);
+      const err = new Error(`${endpoint}: ${resp.status} ${text.substring(0, 500)}`);
+      err.status = resp.status;
+      err.endpoint = endpoint;
+      lastError = err;
+      lastStatus = resp.status;
     } catch (err) {
       console.warn(`[trae-client] Endpoint ${endpoint} error: ${err.message}`);
+      err.status = err.status || 502;
       lastError = err;
+      lastStatus = err.status;
     }
   }
 
-  throw lastError || new Error('All endpoints failed');
+  // 确保抛出的错误对象携带 status 字段,供 server.js 做状态码映射
+  if (lastError) {
+    lastError.status = lastStatus;
+    throw lastError;
+  }
+  throw new Error('All endpoints failed');
 }
 
 /**

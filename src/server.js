@@ -14,18 +14,61 @@ const express = require('express');
 const auth = require('./auth');
 const traeClient = require('./trae-client');
 const { handleOpenAIResponse } = require('./openai-format');
-const { handleAnthropicResponse } = require('./anthropic-format');
+const { handleAnthropicResponse, estimateTokens } = require('./anthropic-format');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
+
+// ============================================================
+// Anthropic 规范错误响应工具
+// ============================================================
+
+/**
+ * 构造符合 Anthropic 规范的错误响应体
+ * 格式: { type: "error", error: { type, message } }
+ */
+function buildAnthropicError(type, message) {
+    return { type: 'error', error: { type, message } };
+}
+
+/**
+ * 上游 HTTP 状态码 → Anthropic 规范状态码 + 错误类型映射
+ */
+function mapUpstreamStatus(status) {
+    if (status === 401 || status === 403) return { status: 401, type: 'authentication_error' };
+    if (status === 404) return { status: 404, type: 'not_found_error' };
+    if (status === 400) return { status: 400, type: 'invalid_request_error' };
+    if (status === 429) return { status: 429, type: 'rate_limit_error' };
+    if (status === 529) return { status: 529, type: 'overloaded_error' };
+    return { status: 502, type: 'api_error' };
+}
+
+/**
+ * 发送 Anthropic 规范错误响应
+ */
+function sendAnthropicError(res, httpStatus, errorType, message) {
+    return res.status(httpStatus).json(buildAnthropicError(errorType, message));
+}
 
 const PORT = parseInt(process.env.PORT || '9220', 10);
 const API_KEY = process.env.API_KEY || '';
 const EDITION = (process.env.TRAE_EDITION || 'cn').toLowerCase();
 const MANUAL_TOKEN = process.env.TRAE_MANUAL_TOKEN || '';
-const BASE_URL = EDITION === 'cn'
-  ? (process.env.BASE_URL || 'https://trae-api-cn.mchost.guru')
-  : (process.env.BASE_URL || 'https://a0ai-api-sg.byteintlapi.com');
+
+// BASE_URL 选择:
+//   cn       → Trae CN 国内版 chat API 端点
+//   solo     → TRAE SOLO CN 国内独立部署版(共用 CN 端点)
+//   sg       → Trae 国际版 chat API 端点
+//   solo-sg  → TRAE SOLO 国际独立部署版(共用 SG 端点)
+// 加密格式:cn/solo/solo-sg 使用 tc 加密;sg 使用 plaintext JSON
+// chat API:cn/solo 共用 mchost.guru;sg/solo-sg 共用 byteintlapi.com
+const DEFAULT_BASE_URLS = {
+  cn: 'https://trae-api-cn.mchost.guru',
+  solo: 'https://trae-api-cn.mchost.guru',
+  sg: 'https://a0ai-api-sg.byteintlapi.com',
+  'solo-sg': 'https://a0ai-api-sg.byteintlapi.com',
+};
+const BASE_URL = process.env.BASE_URL || DEFAULT_BASE_URLS[EDITION] || DEFAULT_BASE_URLS.cn;
 
 // Auth middleware
 function requireAuth(req, res, next) {
@@ -35,7 +78,7 @@ function requireAuth(req, res, next) {
   const xApiKey = req.headers['x-api-key'] || '';
   const token = bearerToken || xApiKey;
   if (token !== API_KEY) {
-    return res.status(401).json({ error: { message: 'Invalid API key', type: 'auth_error' } });
+    return sendAnthropicError(res, 401, 'authentication_error', 'Invalid API key');
   }
   next();
 }
@@ -67,7 +110,7 @@ app.get('/v1/models', requireAuth, async (req, res) => {
     const models = await traeClient.getModels(BASE_URL);
     res.json({ object: 'list', data: models });
   } catch (err) {
-    res.status(500).json({ error: { message: err.message, type: 'server_error' } });
+    return sendAnthropicError(res, 500, 'api_error', err.message);
   }
 });
 
@@ -348,10 +391,10 @@ function convertOpenAIMessages(messages, tools) {
 // ============================================================
 
 app.post('/v1/chat/completions', requireAuth, async (req, res) => {
-  const { messages, model = 'auto', stream = false, tools } = req.body;
+  const { messages, model = 'auto', stream = false, tools, max_tokens } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: { message: 'messages is required', type: 'invalid_request' } });
+    return sendAnthropicError(res, 400, 'invalid_request_error', 'messages is required');
   }
 
   console.log(`[server] OpenAI request: model=${model}, stream=${stream}, messages=${messages.length}, body=${JSON.stringify(req.body).length} bytes`);
@@ -361,7 +404,7 @@ app.post('/v1/chat/completions', requireAuth, async (req, res) => {
 
   try {
     const { response: fetchResp, model: usedModel } = await traeClient.sendChatRequest(
-      converted, model, stream, BASE_URL
+      converted, model, stream, BASE_URL, { maxTokens: max_tokens }
     );
 
     if (stream) {
@@ -377,7 +420,8 @@ app.post('/v1/chat/completions', requireAuth, async (req, res) => {
     }
   } catch (err) {
     console.error(`[server] Chat error: ${err.message}`);
-    res.status(502).json({ error: { message: `Trae API error: ${err.message}`, type: 'upstream_error' } });
+    const mapped = mapUpstreamStatus(err.status || 502);
+    return sendAnthropicError(res, mapped.status, mapped.type, `Trae API error: ${err.message}`);
   }
 });
 
@@ -385,11 +429,59 @@ app.post('/v1/chat/completions', requireAuth, async (req, res) => {
 // Anthropic messages
 // ============================================================
 
+/**
+ * 估算输入 token 数(粗略)
+ * 遍历 system + messages + tools 的全部文本内容
+ */
+function estimateInputTokens(system, messages, tools) {
+    let totalText = '';
+    if (system) {
+        if (typeof system === 'string') totalText += system;
+        else if (Array.isArray(system)) {
+            for (const b of system) totalText += b.text || '';
+        }
+    }
+    if (Array.isArray(messages)) {
+        for (const m of messages) {
+            if (typeof m.content === 'string') totalText += m.content;
+            else if (Array.isArray(m.content)) {
+                for (const b of m.content) {
+                    totalText += b.text || '';
+                    if (b.input) totalText += JSON.stringify(b.input);
+                    if (b.content) {
+                        if (typeof b.content === 'string') totalText += b.content;
+                        else if (Array.isArray(b.content)) {
+                            for (const c of b.content) totalText += c.text || '';
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (Array.isArray(tools)) {
+        totalText += JSON.stringify(tools);
+    }
+    return estimateTokens(totalText);
+}
+
+/**
+ * Anthropic count_tokens 端点
+ * Claude Code 在发送主请求前会调用此端点估算上下文 token 数
+ */
+app.post('/v1/messages/count_tokens', requireAuth, (req, res) => {
+    const { messages, system, tools } = req.body;
+    if (!messages || !Array.isArray(messages)) {
+        return sendAnthropicError(res, 400, 'invalid_request_error', 'messages is required');
+    }
+    const inputTokens = estimateInputTokens(system, messages, tools);
+    res.json({ input_tokens: inputTokens });
+});
+
 app.post('/v1/messages', requireAuth, async (req, res) => {
   const { messages, model = 'auto', stream = false, max_tokens = 4096, system, tools } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: { message: 'messages is required', type: 'invalid_request' } });
+    return sendAnthropicError(res, 400, 'invalid_request_error', 'messages is required');
   }
 
   const bodySize = JSON.stringify(req.body).length;
@@ -415,25 +507,29 @@ app.post('/v1/messages', requireAuth, async (req, res) => {
     console.log(`[server]   out[${i}] role=${m.role}, len=${len}, preview=${preview}`);
   }
 
+  // 估算输入 token 数(用于 Anthropic usage 字段)
+  const inputTokens = estimateInputTokens(system, messages, tools);
+
   try {
     const { response: fetchResp, model: usedModel } = await traeClient.sendChatRequest(
-      converted, model, stream, BASE_URL
+      converted, model, stream, BASE_URL, { maxTokens: max_tokens }
     );
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      const sseStream = await handleAnthropicResponse(fetchResp, usedModel, true);
+      const sseStream = await handleAnthropicResponse(fetchResp, usedModel, true, inputTokens);
       for await (const chunk of sseStream) { res.write(chunk); }
       res.end();
     } else {
-      const result = await handleAnthropicResponse(fetchResp, usedModel, false);
+      const result = await handleAnthropicResponse(fetchResp, usedModel, false, inputTokens);
       res.json(result);
     }
   } catch (err) {
     console.error(`[server] Anthropic error: ${err.message}`);
-    res.status(502).json({ error: { message: `Trae API error: ${err.message}`, type: 'upstream_error' } });
+    const mapped = mapUpstreamStatus(err.status || 502);
+    return sendAnthropicError(res, mapped.status, mapped.type, `Trae API error: ${err.message}`);
   }
 });
 

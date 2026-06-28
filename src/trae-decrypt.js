@@ -1,7 +1,8 @@
 /**
- * trae-decrypt.js - Trae CN "tc" encryption format decryption
+ * trae-decrypt.js - Trae "tc" 加密格式解密
  *
- * Decrypts the encrypted auth data stored in Trae CN's storage.json.
+ * 支持版本: Trae CN / TRAE SOLO CN / TRAE SOLO(国际版) 均使用 tc 加密
+ *          Trae SG(国际版) 直接存储明文 JSON,decryptAuthData 中自动识别
  *
  * Data structure: [6B Header][32B RandomBytes][N EncryptedData]
  * Decrypted:      [64B SHA-512 Hash][N Plaintext JSON]
@@ -184,9 +185,31 @@ function getTraeSGDataDir() {
   return path.join(appData, 'Trae', 'User');
 }
 
+/**
+ * Get TRAE SOLO CN data directory path
+ * SOLO CN 共用 Trae CN 的 tc 加密格式与 chat API 端点,
+ * 仅 storage.json 存储路径不同(目录名为 "TRAE SOLO CN")
+ */
+function getTraeSoloCNDataDir() {
+  const appData = process.env.APPDATA || path.join(process.env.HOME, 'AppData', 'Roaming');
+  return path.join(appData, 'TRAE SOLO CN', 'User');
+}
+
+/**
+ * Get TRAE SOLO (SG 国际版) data directory path
+ * TRAE SOLO 国际版与 TRAE SOLO CN 使用相同的 tc 加密格式,
+ * 但 chat API 端点与 Trae SG 相同(https://a0ai-api-sg.byteintlapi.com)
+ */
+function getTraeSoloSGDataDir() {
+  const appData = process.env.APPDATA || path.join(process.env.HOME, 'AppData', 'Roaming');
+  return path.join(appData, 'TRAE SOLO', 'User');
+}
+
 module.exports = {
   decryptStorageValue,
   decryptAuthData,
   getTraeCNDataDir,
   getTraeSGDataDir,
+  getTraeSoloCNDataDir,
+  getTraeSoloSGDataDir,
 };
