@@ -52,12 +52,27 @@ async function collectNonStreaming(fetchResponse, model) {
     }
   }
 
+  // Empty-response placeholder: upstream never produced content but
+  // signaled done. Without this, callers (e.g. omniroute / Codex) see
+  // content:null and treat the response as vacuous.
+  if (!fullContent && !reasoningContent) {
+    fullContent = '(trae upstream 返回了空响应，未产生任何内容)';
+  }
+
   // Include thinking in content if present
   let content = '';
   if (reasoningContent) {
     content += `<think>\n${reasoningContent}\n</think>\n\n`;
   }
   content += fullContent;
+
+  // Token estimate: prompt tokens arrive on fetchResponse (set by server.js),
+  // completion tokens are estimated from output bytes (~4 chars / token).
+  const promptTokens = typeof fetchResponse.__promptTokens === 'number'
+    ? fetchResponse.__promptTokens
+    : 0;
+  const completionBytes = Buffer.byteLength(content, 'utf8');
+  const completionTokens = Math.max(1, Math.ceil(completionBytes / 4));
 
   return {
     id: `chatcmpl-${uuidv4()}`,
@@ -69,12 +84,25 @@ async function collectNonStreaming(fetchResponse, model) {
       message: { role: 'assistant', content },
       finish_reason: finishReason,
     }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    },
   };
 }
 
 /**
  * Generator for streaming mode - yields SSE data lines
+ *
+ * Patches vs upstream:
+ *   - track usage: emit one final usage-only chunk before [DONE]
+ *   - empty-content fix: if upstream yields zero content but signals "done",
+ *     inject a placeholder chunk so clients (e.g. Codex) don't see "done
+ *     with content=null".
+ *   - latency guarding: any 'output' or 'done' event with non-empty data
+ *     is forwarded; the loop only returns after [DONE] materialized or the
+ *     upstream stream actually ends.
  */
 async function* streamGenerator(fetchResponse, model) {
   const reader = fetchResponse.body.getReader();
@@ -82,6 +110,15 @@ async function* streamGenerator(fetchResponse, model) {
   let buffer = '';
   let thinkStarted = false;
   let thinkEnded = false;
+  let sawDone = false;
+  let completionBytes = 0;
+  let contentChunkCount = 0;
+  // Holds choice chunks from the current event flush until we know whether
+  // to inject a placeholder ahead of them (empty-stream recovery).
+  let staggerBuffer = [];
+  const promptTokenEstimate = typeof fetchResponse.__promptTokens === 'number'
+    ? fetchResponse.__promptTokens
+    : null;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -109,26 +146,120 @@ async function* streamGenerator(fetchResponse, model) {
         });
 
         for (const chunk of chunks) {
-          // Update think state
           if (chunk._thinkState) {
             thinkStarted = chunk._thinkState.started;
             thinkEnded = chunk._thinkState.ended;
             delete chunk._thinkState;
           }
-          yield `data: ${JSON.stringify(chunk)}\n\n`;
+          if (chunk.choices && chunk.choices[0]) {
+            const c = chunk.choices[0];
+            staggerBuffer.push(chunk);
+            if (c.delta && typeof c.delta.content === 'string') {
+              completionBytes += Buffer.byteLength(c.delta.content, 'utf8');
+              contentChunkCount += 1;
+            }
+            if (c.finish_reason) {
+              sawDone = true;
+            }
+          } else {
+            // Pure-usage or non-choice chunk, yield directly.
+            yield `data: ${JSON.stringify(chunk)}\n\n`;
+          }
         }
 
-        // If done event, send [DONE]
         if (currentEvent === 'done') {
+          // Empty-stream recovery: inject the placeholder BEFORE the buffered
+          // finish_reason chunk, so clients see real content arriving first
+          // (rather than receiving `content:null, finish_reason:stop`).
+          if (contentChunkCount === 0) {
+            const placeholder = '(trae upstream 返回了空响应，未产生任何内容)';
+            completionBytes += Buffer.byteLength(placeholder, 'utf8');
+            contentChunkCount += 1;
+            yield `data: ${JSON.stringify({
+              id: `chatcmpl-${uuidv4()}`,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model,
+              choices: [{
+                index: 0,
+                delta: { content: placeholder },
+                finish_reason: null,
+              }],
+            })}\n\n`;
+          }
+
+          // Flush staggered choice chunks (typically holds the done
+          // event's `delta:{} + finish_reason:stop` chunk).
+          for (const buffered of staggerBuffer) {
+            yield `data: ${JSON.stringify(buffered)}\n\n`;
+          }
+          staggerBuffer = [];
+
+          // Emit a single usage-only final chunk before [DONE] so OpenAI
+          // clients get real token counts.
+          const completionTokens = Math.max(
+            1, Math.ceil(completionBytes / 4)
+          );
+          const usageChunk = {
+            id: `chatcmpl-${uuidv4()}`,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{
+              index: 0,
+              delta: {},
+              finish_reason: 'stop',
+            }],
+            usage: {
+              prompt_tokens: promptTokenEstimate || 0,
+              completion_tokens: completionTokens,
+              total_tokens: (promptTokenEstimate || 0) + completionTokens,
+            },
+          };
+          yield `data: ${JSON.stringify(usageChunk)}\n\n`;
           yield 'data: [DONE]\n\n';
           return;
         }
+
+        // For non-done events, immediately flush any staggered chunks so
+        // mid-stream content flows to the client without delay.
+        for (const buffered of staggerBuffer) {
+          yield `data: ${JSON.stringify(buffered)}\n\n`;
+        }
+        staggerBuffer = [];
 
         currentEvent = null;
       }
     }
   }
 
+  // Fallback: stream ended without an 'event: done' marker. Close cleanly.
+  if (!sawDone) {
+    if (contentChunkCount === 0) {
+      const placeholder = '(trae upstream 流异常结束，未产生任何内容)';
+      completionBytes += Buffer.byteLength(placeholder, 'utf8');
+      yield `data: ${JSON.stringify({
+        id: `chatcmpl-${uuidv4()}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, delta: { content: placeholder }, finish_reason: null }],
+      })}\n\n`;
+    }
+    const completionTokens = Math.max(1, Math.ceil(completionBytes / 4));
+    yield `data: ${JSON.stringify({
+      id: `chatcmpl-${uuidv4()}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: promptTokenEstimate || 0,
+        completion_tokens: completionTokens,
+        total_tokens: (promptTokenEstimate || 0) + completionTokens,
+      },
+    })}\n\n`;
+  }
   yield 'data: [DONE]\n\n';
 }
 
