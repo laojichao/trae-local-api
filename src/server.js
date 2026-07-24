@@ -407,6 +407,12 @@ app.post('/v1/chat/completions', requireAuth, async (req, res) => {
       converted, model, stream, BASE_URL, { maxTokens: max_tokens }
     );
 
+    // Patch: tag the response with an estimated prompt token count so
+    // openai-format can populate response.usage.prompt_tokens.
+    try {
+      fetchResp.__promptTokens = estimateOpenAIPromptTokens(messages);
+    } catch { /* non-fatal */ }
+
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -460,6 +466,29 @@ function estimateInputTokens(system, messages, tools) {
     }
     if (Array.isArray(tools)) {
         totalText += JSON.stringify(tools);
+    }
+    return estimateTokens(totalText);
+}
+
+/**
+ * OpenAI-format prompt token estimator. Mirrors the Anthropic helper but
+ * takes raw OpenAI-style messages only.
+ *
+ * Tools (function schemas) are deliberately excluded from the estimate:
+ * they are not actual prompt text read by the model, and including them
+ * blows up token counts by 30-50x for clients like Codex that attach many
+ * MCP tool definitions to every request.
+ */
+function estimateOpenAIPromptTokens(messages) {
+    let totalText = '';
+    for (const m of messages) {
+        if (typeof m.content === 'string') totalText += m.content;
+        else if (Array.isArray(m.content)) {
+            for (const b of m.content) {
+                if (b && typeof b.text === 'string') totalText += b.text;
+                else if (b && typeof b.content === 'string') totalText += b.content;
+            }
+        }
     }
     return estimateTokens(totalText);
 }
